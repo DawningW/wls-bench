@@ -1,0 +1,57 @@
+#include "version.h"
+#define RC_CRP_VERSION CRP_VER ".0.0"
+
+// resources.h
+
+#if defined(__MINGW64__) || defined(__MINGW32__)
+	// MinGW-w64, MinGW
+	#if defined(__has_include) && __has_include(<winres.h>)
+		#include "winres.h"
+	#else
+		#include "afxres.h"
+		#include "winresrc.h"
+	#endif
+#else
+	// MSVC, Windows SDK
+	#include "winres.h"
+#endif
+
+// 中文(简体，中国) resources
+#if !defined(AFX_RESOURCE_DLL) || defined(AFX_TARG_CHS)
+LANGUAGE LANG_CHINESE, SUBLANG_CHINESE_SIMPLIFIED
+
+// Version
+VS_VERSION_INFO VERSIONINFO
+    FILEVERSION CRP_VER_MAJOR,CRP_VER_MINOR,0,0
+    PRODUCTVERSION CRP_VER_MAJOR,CRP_VER_MINOR,0,0
+    FILEFLAGSMASK 0x3fL
+#ifdef _DEBUG
+    FILEFLAGS 0x1L
+#else
+    FILEFLAGS 0x0L
+#endif
+    FILEOS 0x40004L
+    FILETYPE 0x2L
+    FILESUBTYPE 0x0L
+BEGIN
+    BLOCK "StringFileInfo"
+    BEGIN
+        BLOCK "080404b0"
+        BEGIN
+            VALUE "CompanyName", "OurEDA"
+            VALUE "FileDescription", "珊瑚礁播放器"
+            VALUE "FileVersion", RC_CRP_VERSION
+            VALUE "InternalName", "CoralReefPlayer.dll"
+            VALUE "LegalCopyright", "Copyright (C) 2023-2025 OurEDA"
+            VALUE "OriginalFilename", "CoralReefPlayer.dll"
+            VALUE "ProductName", "CoralReefPlayer"
+            VALUE "ProductVersion", RC_CRP_VERSION
+        END
+    END
+    BLOCK "VarFileInfo"
+    BEGIN
+        VALUE "Translation", 0x804, 1200
+    END
+END
+
+#endif // 中文(简体，中国) resources

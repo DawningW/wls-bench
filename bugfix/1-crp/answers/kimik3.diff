@@ -1,0 +1,190 @@
+diff --git a/src/StreamPuller.cpp b/src/StreamPuller.cpp
+index ddf5819..7013cd6 100644
+--- a/src/StreamPuller.cpp
++++ b/src/StreamPuller.cpp
+@@ -9,6 +9,7 @@
+ #include <emscripten/fetch.h>
+ #endif
+ #include "SimpleRTPSource.hh"
++#include "GroupsockHelper.hh" // for increaseReceiveBufferTo
+ #include "H264VideoRTPSource.hh" // for parseSPropParameterSets
+ #include "MPEG4LATMAudioRTPSource.hh" // for parseGeneralConfigStr
+ #include "MPEG2IndexFromTransportStream.hh" // for TRANSPORT_PACKET_SIZE
+@@ -299,6 +300,13 @@ void StreamPuller::runRTP()
+     copyAddress(sessionAddress, sessionAddresses.firstAddress());
+     Port rtpPort(port);
+     Groupsock rtpSocket(*environment, sessionAddress, rtpPort, 1);
++    // The default receive buffer (50 KB, set in MultiFramedRTPSource) is too
++    // small for bursty RTP/UDP streams: while the (single-threaded) event loop
++    // is busy demuxing/parsing/decoding a large frame, subsequent packets keep
++    // arriving at line rate and may overflow the kernel socket buffer, causing
++    // packet loss that never shows up in a packet capture (Wireshark sees
++    // packets before the socket layer). Use a larger buffer to absorb bursts.
++    increaseReceiveBufferTo(*environment, rtpSocket.socketNum(), 2 * 1024 * 1024);
+ 
+     unsigned char payloadType = 0;
+     FramedSource* source = NULL;
+@@ -962,6 +970,16 @@ void StreamPuller::createTransportStream(PIDState_STREAM *pidState, StreamType &
+                             STREAM_TYPE_CODEC_MAP.at(pidState->stream_type) : "";
+ 
+     FramedSource *inputSource = pidState->streamSource;
++    // The demuxed track delivers PES fragments of at most one TS packet payload
++    // (184 bytes) at a time. If "maxFrameSize()" is left at 0, the downstream
++    // StreamParser (H264/H265VideoStreamFramer) may issue read requests smaller
++    // than one fragment when its bank is nearly full, causing the demuxer to
++    // truncate the fragment and silently drop the remaining bytes (see
++    // MPEG2TransportStreamParser::processStreamPacket). This corrupts the
++    // elementary stream mid-NAL-unit, showing up as mosaic/"tearing" pictures.
++    // Specifying a maxFrameSize of one TS packet forces the StreamParser to
++    // swap banks early enough that its read requests always fit one fragment.
++    inputSource->setMaxFrameSize(TRANSPORT_PACKET_SIZE);
+     if (streamType.dataType == StreamType::VIDEO)
+     {
+         videoDecoder = VideoDecoder::createNew(codecName,
+diff --git a/src/StreamSink.cpp b/src/StreamSink.cpp
+index 6b04d0e..af4aff1 100644
+--- a/src/StreamSink.cpp
++++ b/src/StreamSink.cpp
+@@ -39,6 +39,10 @@ void StreamSink::afterGettingFrame(unsigned frameSize, unsigned numTruncatedByte
+     envir() << "\n";
+ #endif
+ 
++    if (numTruncatedBytes > 0)
++        envir() << "StreamSink::afterGettingFrame() warning: " << numTruncatedBytes
++            << " bytes of trailing data were truncated from a " << frameSize << "-byte frame!\n";
++
+     uint8_t* buffer = fReceiveBuffer + 4;
+     if (fH264OrH265)
+     {
+diff --git a/src/VideoDecoder.cpp b/src/VideoDecoder.cpp
+index 1c2b427..193e9ca 100644
+--- a/src/VideoDecoder.cpp
++++ b/src/VideoDecoder.cpp
+@@ -92,6 +92,29 @@ static bool extractH264Or5Frame(AVPacket* pkt, int& offset, int& size, int& mark
+     return false;
+ }
+ 
++// Scan the packet's NAL units to check whether it contains a VCL NAL unit.
++// Packets without any VCL NAL unit (only SPS/PPS/AUD/SEI etc.) produce no
++// frame from the decoder, which must not be treated as a decode error.
++static bool packetHasVclNal(AVPacket* pkt, bool isH265)
++{
++    int offset = 0;
++    int size = 0;
++    int markerSize = 0;
++    while (extractH264Or5Frame(pkt, offset, size, markerSize))
++    {
++        int nalType;
++        if (isH265)
++            nalType = (pkt->data[offset + markerSize] & 0x7E) >> 1;
++        else
++            nalType = pkt->data[offset + markerSize] & 0x1F;
++        if (isH265 ? nalType <= 31 : (nalType >= 1 && nalType <= 5))
++            return true;
++        if (size <= 0)
++            break;
++    }
++    return false;
++}
++
+ VideoDecoder* VideoDecoder::createNew(const std::string& codecName, Format format, int width, int height,
+                                         const std::string& deviceName)
+ {
+@@ -220,9 +243,21 @@ VideoDecoder::~VideoDecoder()
+ 
+ bool VideoDecoder::processPacket(AVPacket* packet)
+ {
++    // Debug hook: dump every packet fed to the decoder for offline analysis
++    static FILE* dumpFile = []()
++    {
++        const char* path = getenv("CRP_DUMP_PACKETS");
++        return path != nullptr ? fopen(path, "wb") : nullptr;
++    }();
++    if (dumpFile != nullptr && packet->data != nullptr && packet->size > 0)
++    {
++        fwrite(packet->data, 1, packet->size, dumpFile);
++        fflush(dumpFile);
++    }
+     if (avcodec_send_packet(codecCtx, packet) < 0)
+     {
+-        fprintf(stderr, "Decode Error.\n");
++        if (!nonVclOnly)
++            fprintf(stderr, "Decode Error.\n");
+         return false;
+     }
+ 
+@@ -364,6 +399,7 @@ bool H264VideoDecoder::processPacket(AVPacket* packet)
+     }
+ 
+     codecCtx->has_b_frames = 0; // 丢帧使reordering buffer增大导致延迟变高
++    nonVclOnly = !packetHasVclNal(packet, false);
+     return VideoDecoder::processPacket(packet);
+ }
+ 
+@@ -432,6 +468,7 @@ bool H265VideoDecoder::processPacket(AVPacket* packet)
+     }
+ 
+     codecCtx->has_b_frames = 0;
++    nonVclOnly = !packetHasVclNal(packet, true);
+     return VideoDecoder::processPacket(packet);
+ }
+ 
+diff --git a/src/VideoDecoder.h b/src/VideoDecoder.h
+index 423c548..8c4f4e6 100644
+--- a/src/VideoDecoder.h
++++ b/src/VideoDecoder.h
+@@ -36,6 +36,11 @@ protected:
+     AVFrame* frame;
+     SwsContext* swsCtx;
+ 
++    // Set by H264/H265 decoders when the packet contains no VCL NAL unit
++    // (e.g. only SPS/PPS/AUD/SEI). Such packets legitimately produce no frame,
++    // so a send failure must not be reported as a decode error.
++    bool nonVclOnly = false;
++
+     Frame outFrame;
+ };
+ 
+diff --git a/thirdparty/ffmpeg/Android/include b/thirdparty/ffmpeg/Android/include
+deleted file mode 120000
+index f5030fe..0000000
+--- a/thirdparty/ffmpeg/Android/include
++++ /dev/null
+@@ -1 +0,0 @@
+-../include
+\ No newline at end of file
+diff --git a/thirdparty/ffmpeg/Emscripten/include b/thirdparty/ffmpeg/Emscripten/include
+deleted file mode 120000
+index f5030fe..0000000
+--- a/thirdparty/ffmpeg/Emscripten/include
++++ /dev/null
+@@ -1 +0,0 @@
+-../include
+\ No newline at end of file
+diff --git a/thirdparty/ffmpeg/iOS/include b/thirdparty/ffmpeg/iOS/include
+deleted file mode 120000
+index f5030fe..0000000
+--- a/thirdparty/ffmpeg/iOS/include
++++ /dev/null
+@@ -1 +0,0 @@
+-../include
+\ No newline at end of file
+diff --git a/thirdparty/live555/liveMedia/MPEG2TransportStreamParser_STREAM.cpp b/thirdparty/live555/liveMedia/MPEG2TransportStreamParser_STREAM.cpp
+index 8e83b2b..f0e86e4 100644
+--- a/thirdparty/live555/liveMedia/MPEG2TransportStreamParser_STREAM.cpp
++++ b/thirdparty/live555/liveMedia/MPEG2TransportStreamParser_STREAM.cpp
+@@ -54,6 +54,14 @@ Boolean MPEG2TransportStreamParser
+     if (numBytesToDeliver > streamSource->maxSize()) {
+       streamSource->frameSize() = streamSource->maxSize();
+       streamSource->numTruncatedBytes() = numBytesToDeliver - streamSource->maxSize();
++      // Truncating a PES fragment silently drops bytes from the elementary
++      // stream (corrupting it). Downstream readers should avoid read requests
++      // smaller than one fragment (e.g. by specifying a suitable
++      // "maxFrameSize()" for this source).
++      envir() << "MPEG2TransportStreamParser::processStreamPacket() warning: truncated "
++          << streamSource->numTruncatedBytes() << " of " << numBytesToDeliver
++          << " bytes for PID " << (unsigned) pidState->PID
++          << "; elementary stream data will be lost!\n";
+     } else {
+       streamSource->frameSize() = numBytesToDeliver;
+       streamSource->numTruncatedBytes() = 0;

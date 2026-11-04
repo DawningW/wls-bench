@@ -1,0 +1,67 @@
+diff --git a/thirdparty/ffmpeg/Android/include b/thirdparty/ffmpeg/Android/include
+deleted file mode 120000
+index f5030fe..0000000
+--- a/thirdparty/ffmpeg/Android/include
++++ /dev/null
+@@ -1 +0,0 @@
+-../include
+\ No newline at end of file
+diff --git a/thirdparty/ffmpeg/Emscripten/include b/thirdparty/ffmpeg/Emscripten/include
+deleted file mode 120000
+index f5030fe..0000000
+--- a/thirdparty/ffmpeg/Emscripten/include
++++ /dev/null
+@@ -1 +0,0 @@
+-../include
+\ No newline at end of file
+diff --git a/thirdparty/ffmpeg/iOS/include b/thirdparty/ffmpeg/iOS/include
+deleted file mode 120000
+index f5030fe..0000000
+--- a/thirdparty/ffmpeg/iOS/include
++++ /dev/null
+@@ -1 +0,0 @@
+-../include
+\ No newline at end of file
+diff --git a/thirdparty/live555/liveMedia/MPEG2TransportStreamDemuxedTrack.cpp b/thirdparty/live555/liveMedia/MPEG2TransportStreamDemuxedTrack.cpp
+index 358664f..7775468 100644
+--- a/thirdparty/live555/liveMedia/MPEG2TransportStreamDemuxedTrack.cpp
++++ b/thirdparty/live555/liveMedia/MPEG2TransportStreamDemuxedTrack.cpp
+@@ -20,10 +20,38 @@ along with this library; if not, write to the Free Software Foundation, Inc.,
+ 
+ #include "MPEG2TransportStreamParser.hh"
+ 
++#ifndef TRANSPORT_PACKET_SIZE
++#define TRANSPORT_PACKET_SIZE 188
++#endif
++// Deliberately larger than the maximum size this source can deliver in one
++// frame (one TS packet payload = 188 - 4 = 184 bytes).  The downstream
++// StreamParser swaps its bank when "fCurParserIndex + maxFrameSize() > BANK_SIZE",
++// so this value only controls *how early* the swap happens; the extra margin
++// guarantees the swap always happens before the bank is full.
++// (Same value as StreamPuller's MAX_TS_FRAME_SIZE = 7 * TRANSPORT_PACKET_SIZE.)
++#define DEMUXED_TRACK_MAX_FRAME_SIZE (7 * TRANSPORT_PACKET_SIZE)
++
+ MPEG2TransportStreamDemuxedTrack
+ ::MPEG2TransportStreamDemuxedTrack(MPEG2TransportStreamParser& ourParser, u_int16_t pid)
+   : FramedSource(ourParser.envir()),
+     fOurParser(ourParser), fPID(pid) {
++#if CRP_MODIFY
++  // A downstream StreamParser (e.g. the parser inside H264or5VideoStreamFramer)
++  // uses our maxFrameSize() to decide when to swap its internal parser bank:
++  // it swaps only when "fCurParserIndex + maxFrameSize() > BANK_SIZE".
++  // With the default maxFrameSize() == 0 the swap happens only when the bank is
++  // completely full, so the buffer offered to us via getNextFrame() can shrink
++  // to just a few bytes.  MPEG2TransportStreamParser::processStreamPacket()
++  // then truncates the delivery to that tiny buffer and *skips* (discards) the
++  // remaining TS payload bytes, silently corrupting the video stream
++  // (missing macroblock data -> mosaic/tearing in the decoded picture).
++  // See also MPEG2TransportStreamSource::maxFrameSize() in StreamPuller.cpp,
++  // which works around the same issue for the RTP->TS stage.
++  // A non-zero maxFrameSize() forces the downstream bank to be swapped early
++  // enough that the offered buffer is always large enough for a whole
++  // TS packet payload, so no data is ever truncated.
++  setMaxFrameSize(DEMUXED_TRACK_MAX_FRAME_SIZE);
++#endif
+ }
+ 
+ MPEG2TransportStreamDemuxedTrack::~MPEG2TransportStreamDemuxedTrack() {

@@ -1,0 +1,60 @@
+diff --git a/thirdparty/live555/liveMedia/MPEG2TransportStreamDemuxedTrack.cpp b/thirdparty/live555/liveMedia/MPEG2TransportStreamDemuxedTrack.cpp
+index 358664f..8c8cb2d 100644
+--- a/thirdparty/live555/liveMedia/MPEG2TransportStreamDemuxedTrack.cpp
++++ b/thirdparty/live555/liveMedia/MPEG2TransportStreamDemuxedTrack.cpp
+@@ -19,6 +19,7 @@ along with this library; if not, write to the Free Software Foundation, Inc.,
+ // Implementation
+ 
+ #include "MPEG2TransportStreamParser.hh"
++#include "MPEG2IndexFromTransportStream.hh" // for TRANSPORT_PACKET_SIZE
+ 
+ MPEG2TransportStreamDemuxedTrack
+ ::MPEG2TransportStreamDemuxedTrack(MPEG2TransportStreamParser& ourParser, u_int16_t pid)
+@@ -32,3 +33,15 @@ MPEG2TransportStreamDemuxedTrack::~MPEG2TransportStreamDemuxedTrack() {
+ void MPEG2TransportStreamDemuxedTrack::doGetNextFrame() {
+   fOurParser.continueParsing();
+ }
++
++unsigned MPEG2TransportStreamDemuxedTrack::maxFrameSize() const {
++  // The maximum amount of data that the parser will deliver to us in a single read
++  // is the payload of a Transport Stream packet (188 bytes - 4-byte header).
++  // We must tell this to our reader (usually a "StreamParser"), so that it can
++  // ensure that it never has less room than this when it asks us for data.
++  // Otherwise "MPEG2TransportStreamParser::processStreamPacket()" would silently
++  // discard ('skipBytes') the data that doesn't fit into the reader's buffer,
++  // corrupting the elementary stream (seen as macroblock corruption/tearing
++  // in decoded video).
++  return TRANSPORT_PACKET_SIZE - 4;
++}
+diff --git a/thirdparty/live555/liveMedia/MPEG2TransportStreamDemuxedTrack.hh b/thirdparty/live555/liveMedia/MPEG2TransportStreamDemuxedTrack.hh
+index c2f7065..1ab9193 100644
+--- a/thirdparty/live555/liveMedia/MPEG2TransportStreamDemuxedTrack.hh
++++ b/thirdparty/live555/liveMedia/MPEG2TransportStreamDemuxedTrack.hh
+@@ -33,6 +33,7 @@ public:
+ private:
+   // redefined virtual functions:
+   virtual void doGetNextFrame();
++  virtual unsigned maxFrameSize() const;
+ 
+ private: // We are accessed only by "MPEG2TransportStreamParser" (a friend)
+   friend class MPEG2TransportStreamParser;
+diff --git a/thirdparty/live555/liveMedia/StreamParser.cpp b/thirdparty/live555/liveMedia/StreamParser.cpp
+index 433f0ff..b35b476 100644
+--- a/thirdparty/live555/liveMedia/StreamParser.cpp
++++ b/thirdparty/live555/liveMedia/StreamParser.cpp
+@@ -126,7 +126,14 @@ void StreamParser::ensureValidBytes1(unsigned numBytesNeeded) {
+ 
+   // First, check whether these new bytes would overflow the current
+   // bank.  If so, start using a new bank now.
+-  if (fCurParserIndex + numBytesNeeded > BANK_SIZE) {
++  // Note: We also swap banks if the bytes already buffered (but perhaps not
++  // yet parsed) would leave less room than "numBytesNeeded".  Otherwise we
++  // could end up asking our input source for less than a full 'frame' worth
++  // of data; sources whose data comes in fixed-size chunks (e.g., Transport
++  // Stream packet payloads) would then have to throw away the data that
++  // doesn't fit into the reader's buffer, corrupting the stream.
++  if (fCurParserIndex + numBytesNeeded > BANK_SIZE
++      || fTotNumValidBytes + numBytesNeeded > BANK_SIZE) {
+     // Swap banks, but save any still-needed bytes from the old bank:
+     unsigned numBytesToSave = fTotNumValidBytes - fSavedParserIndex;
+     unsigned char const* from = &curBank()[fSavedParserIndex];

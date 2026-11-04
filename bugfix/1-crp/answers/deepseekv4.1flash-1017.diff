@@ -1,0 +1,50 @@
+diff --git a/thirdparty/live555/liveMedia/MPEG2TransportStreamDemuxedTrack.cpp b/thirdparty/live555/liveMedia/MPEG2TransportStreamDemuxedTrack.cpp
+index 358664f..2226cb4 100644
+--- a/thirdparty/live555/liveMedia/MPEG2TransportStreamDemuxedTrack.cpp
++++ b/thirdparty/live555/liveMedia/MPEG2TransportStreamDemuxedTrack.cpp
+@@ -20,10 +20,20 @@ along with this library; if not, write to the Free Software Foundation, Inc.,
+ 
+ #include "MPEG2TransportStreamParser.hh"
+ 
++// A single 'doGetNextFrame()' call delivers (at most) the payload of one MPEG Transport
++// Stream packet, i.e. 188 bytes minus its 4-byte header and any adaptation field.
++// Downstream parsers use this value ('FramedSource::maxFrameSize()') to make sure that
++// there is always enough room in their buffer to accept a complete frame; without it they
++// may have to truncate a delivery, which would silently corrupt the byte stream.
++#define DEMUXED_TRACK_MAX_FRAME_SIZE 188
++
+ MPEG2TransportStreamDemuxedTrack
+ ::MPEG2TransportStreamDemuxedTrack(MPEG2TransportStreamParser& ourParser, u_int16_t pid)
+   : FramedSource(ourParser.envir()),
+     fOurParser(ourParser), fPID(pid) {
++#if CRP_MODIFY
++  setMaxFrameSize(DEMUXED_TRACK_MAX_FRAME_SIZE);
++#endif
+ }
+ 
+ MPEG2TransportStreamDemuxedTrack::~MPEG2TransportStreamDemuxedTrack() {
+diff --git a/thirdparty/live555/liveMedia/StreamParser.cpp b/thirdparty/live555/liveMedia/StreamParser.cpp
+index 433f0ff..3c57027 100644
+--- a/thirdparty/live555/liveMedia/StreamParser.cpp
++++ b/thirdparty/live555/liveMedia/StreamParser.cpp
+@@ -122,11 +122,19 @@ void StreamParser::ensureValidBytes1(unsigned numBytesNeeded) {
+   // We need to read some more bytes from the input source.
+   // First, clarify how much data to ask for:
+   unsigned maxInputFrameSize = fInputSource->maxFrameSize();
++  if (maxInputFrameSize == 0) maxInputFrameSize = numBytesNeeded;
+   if (maxInputFrameSize > numBytesNeeded) numBytesNeeded = maxInputFrameSize;
+ 
+   // First, check whether these new bytes would overflow the current
+   // bank.  If so, start using a new bank now.
+-  if (fCurParserIndex + numBytesNeeded > BANK_SIZE) {
++  // Also start using a new bank if the space remaining at the end of the current bank
++  // would not be large enough to hold a complete frame from our input source.  Without
++  // this, the input source would have to truncate such a frame (dropping the rest of it),
++  // which would silently corrupt the byte stream.  (Note that a source's frame size is
++  // not necessarily a divisor of BANK_SIZE, so this can happen even for streams that
++  // otherwise parse correctly.)
++  if (fCurParserIndex + numBytesNeeded > BANK_SIZE ||
++      fTotNumValidBytes + maxInputFrameSize > BANK_SIZE) {
+     // Swap banks, but save any still-needed bytes from the old bank:
+     unsigned numBytesToSave = fTotNumValidBytes - fSavedParserIndex;
+     unsigned char const* from = &curBank()[fSavedParserIndex];

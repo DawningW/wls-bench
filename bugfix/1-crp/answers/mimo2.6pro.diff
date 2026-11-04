@@ -1,0 +1,77 @@
+diff --git a/thirdparty/live555/liveMedia/MPEG2TransportStreamDemuxedTrack.cpp b/thirdparty/live555/liveMedia/MPEG2TransportStreamDemuxedTrack.cpp
+index 358664f..f9fd7d9 100644
+--- a/thirdparty/live555/liveMedia/MPEG2TransportStreamDemuxedTrack.cpp
++++ b/thirdparty/live555/liveMedia/MPEG2TransportStreamDemuxedTrack.cpp
+@@ -20,6 +20,10 @@ along with this library; if not, write to the Free Software Foundation, Inc.,
+ 
+ #include "MPEG2TransportStreamParser.hh"
+ 
++#ifndef TRANSPORT_PACKET_SIZE
++#define TRANSPORT_PACKET_SIZE 188
++#endif
++
+ MPEG2TransportStreamDemuxedTrack
+ ::MPEG2TransportStreamDemuxedTrack(MPEG2TransportStreamParser& ourParser, u_int16_t pid)
+   : FramedSource(ourParser.envir()),
+@@ -32,3 +36,17 @@ MPEG2TransportStreamDemuxedTrack::~MPEG2TransportStreamDemuxedTrack() {
+ void MPEG2TransportStreamDemuxedTrack::doGetNextFrame() {
+   fOurParser.continueParsing();
+ }
++
++unsigned MPEG2TransportStreamDemuxedTrack::maxFrameSize() const {
++  // Each delivery contains at most one Transport Stream packet's PES payload,
++  // i.e., at most 188-4 = 184 bytes.  We report 2 TS packets' worth so that a
++  // downstream "StreamParser" (e.g., the one inside "H264or5VideoStreamFramer")
++  // always reserves enough bank room for a complete delivery:  // "StreamParser::ensureValidBytes1()" inflates its "numBytesNeeded" to this
++  // value, which makes it swap banks early enough that the buffer it gives us
++  // ("BANK_SIZE - fTotNumValidBytes") is always >= 184 bytes.  If we reported
++  // 0 (the default), the swap would happen too late, and near the end of each
++  // 150KB bank our delivery would get truncated and the excess ES bytes
++  // silently skipBytes()'d by "processStreamPacket()" -> permanent holes in
++  // the elementary stream -> mosaic/tearing on decode.
++  return 2*TRANSPORT_PACKET_SIZE;
++}
+diff --git a/thirdparty/live555/liveMedia/MPEG2TransportStreamDemuxedTrack.hh b/thirdparty/live555/liveMedia/MPEG2TransportStreamDemuxedTrack.hh
+index c2f7065..1ab9193 100644
+--- a/thirdparty/live555/liveMedia/MPEG2TransportStreamDemuxedTrack.hh
++++ b/thirdparty/live555/liveMedia/MPEG2TransportStreamDemuxedTrack.hh
+@@ -33,6 +33,7 @@ public:
+ private:
+   // redefined virtual functions:
+   virtual void doGetNextFrame();
++  virtual unsigned maxFrameSize() const;
+ 
+ private: // We are accessed only by "MPEG2TransportStreamParser" (a friend)
+   friend class MPEG2TransportStreamParser;
+diff --git a/thirdparty/live555/liveMedia/MPEG2TransportStreamParser_STREAM.cpp b/thirdparty/live555/liveMedia/MPEG2TransportStreamParser_STREAM.cpp
+index 8e83b2b..23573e7 100644
+--- a/thirdparty/live555/liveMedia/MPEG2TransportStreamParser_STREAM.cpp
++++ b/thirdparty/live555/liveMedia/MPEG2TransportStreamParser_STREAM.cpp
+@@ -191,8 +191,8 @@ unsigned MPEG2TransportStreamParser
+       }
+ 
+       if (ES_rate_flag) {
+-	// Skip over the ES_rate
+-        skipBytes(6);
++	// Skip over the ES_rate (22 bits + 2 marker bits = 3 bytes; see ISO 13818-1 Table 2-22)
++        skipBytes(3);
+       }
+ 
+       if (DSM_trick_mode_flag) {
+diff --git a/thirdparty/live555/liveMedia/MultiFramedRTPSource.cpp b/thirdparty/live555/liveMedia/MultiFramedRTPSource.cpp
+index a0098a1..1ec382b 100644
+--- a/thirdparty/live555/liveMedia/MultiFramedRTPSource.cpp
++++ b/thirdparty/live555/liveMedia/MultiFramedRTPSource.cpp
+@@ -73,7 +73,11 @@ MultiFramedRTPSource
+   fReorderingBuffer = new ReorderingPacketBuffer(packetFactory);
+ 
+   // Try to use a big receive buffer for RTP:
+-  increaseReceiveBufferTo(env, RTPgs->socketNum(), 50*1024);
++  // CRP_MODIFY: raised from 50KB to 2MB.  MPEG2-TS-over-RTP multicast delivers
++  // up to ~46KB bursts per 5ms; while the (synchronous) decoder blocks this
++  // thread, a 50KB socket buffer overflows and the kernel silently drops the
++  // excess - invisible to any capture taken above the socket layer.
++  increaseReceiveBufferTo(env, RTPgs->socketNum(), 2*1024*1024);
+ }
+ 
+ void MultiFramedRTPSource::reset() {

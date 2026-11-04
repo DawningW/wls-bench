@@ -1,0 +1,185 @@
+diff --git a/src/StreamPuller.cpp b/src/StreamPuller.cpp
+index ddf5819..823ecef 100644
+--- a/src/StreamPuller.cpp
++++ b/src/StreamPuller.cpp
+@@ -8,6 +8,7 @@
+ #include <emscripten.h>
+ #include <emscripten/fetch.h>
+ #endif
++#include "FramedFilter.hh"
+ #include "SimpleRTPSource.hh"
+ #include "H264VideoRTPSource.hh" // for parseSPropParameterSets
+ #include "MPEG4LATMAudioRTPSource.hh" // for parseGeneralConfigStr
+@@ -70,6 +71,136 @@ public:
+     }
+ };
+ 
++/*
++ * Re-chunks the incoming Transport Stream so that only whole 188-byte TS packets are ever
++ * handed to the demuxer.
++ *
++ * Why this is needed:
++ *   "MPEG2TransportStreamDemux" is a "StreamParser" and reads through a fixed 150000-byte
++ *   bank ("BANK_SIZE").  Whenever it needs more data it asks its input source for
++ *   "BANK_SIZE - fTotNumValidBytes" bytes.  This particular camera sends 1128 bytes
++ *   (6 * 188) per RTP packet, and 1128 does not divide 150000 evenly, so near the end of a
++ *   bank cycle the space left is smaller than one packet.  "MultiFramedRTPSource::
++ *   doGetNextFrame1()" then copies only the part that fits and silently throws the rest away
++ *   (counted in "fNumTruncatedBytes").
++ *
++ *   Measured by replaying the capture through the real live555 classes: the RTP path lost
++ *   bytes 68 times (every ~133rd packet: #132, #265, #398, ...), 7208 bytes in total, the
++ *   first one at TS byte offset 150000.  Those bytes sit in the middle of a PES packet, so
++ *   the H.264 framer is handed a truncated NAL unit -> mosaic and tearing, most visibly when
++ *   the picture changes, because a new picture depends on the reference data carried in
++ *   exactly those bytes.
++ *
++ *   With this filter in front, the number of dropped bytes is 0 (verified on the same capture).
++ *
++ * Why the RTSP path of this player never showed the artefact:
++ *   live555 builds the RTSP MP2T receive chain as
++ *   "SimpleRTPSource -> MPEG2TransportStreamFramer -> MPEG2TransportStreamDemux"
++ *   (see "MediaSession::createSourceObjects()").  The framer sits in the same position and
++ *   does the same job, which is why that path is unaffected.  The RTP-multicast path here
++ *   fed the demuxer straight from "SimpleRTPSource", skipping that stage.
++ *
++ * This filter is a pure re-chunking stage: it never reorders, never duplicates and never
++ * drops payload bytes, so it adds no latency.
++ */
++class TSFrameAlignSource : public FramedFilter
++{
++public:
++    static TSFrameAlignSource* createNew(UsageEnvironment& env, FramedSource* inputSource)
++    {
++        return new TSFrameAlignSource(env, inputSource);
++    }
++
++protected:
++    TSFrameAlignSource(UsageEnvironment& env, FramedSource* inputSource)
++        : FramedFilter(env, inputSource), fNumBytesBuffered(0),
++          fBufferSize(MAX_TS_FRAME_SIZE * 2)
++    {
++        fBuffer = new unsigned char[fBufferSize];
++    }
++
++    virtual ~TSFrameAlignSource()
++    {
++        delete[] fBuffer;
++    }
++
++    void doGetNextFrame()
++    {
++        // Deliver whatever whole TS packets we already have buffered.
++        if (fNumBytesBuffered >= TRANSPORT_PACKET_SIZE) {
++            deliver();
++            return;
++        }
++
++        // Otherwise pull more payload in, appending after what we kept.
++        fillBuffer();
++    }
++
++    void fillBuffer()
++    {
++        fInputSource->getNextFrame(fBuffer + fNumBytesBuffered,
++            (unsigned)(fBufferSize - fNumBytesBuffered),
++            afterGettingFrame, this, FramedSource::handleClosure, this);
++    }
++
++    static void afterGettingFrame(void* clientData, unsigned frameSize, unsigned,
++        struct timeval presentationTime, unsigned)
++    {
++        ((TSFrameAlignSource*)clientData)->afterGettingFrame1(frameSize, presentationTime);
++    }
++
++    void afterGettingFrame1(unsigned numBytesRead, struct timeval presentationTime)
++    {
++        fNumBytesBuffered += numBytesRead;
++        fCurPresentationTime = presentationTime;
++        deliver();
++    }
++
++    void deliver()
++    {
++        // Hand out an integral number of TS packets, so the demuxer's bank never ends up
++        // holding a partial TS packet.  Never exceed what our client asked for.
++        unsigned numBytesToDeliver = (fNumBytesBuffered / TRANSPORT_PACKET_SIZE) * TRANSPORT_PACKET_SIZE;
++        if (numBytesToDeliver > fMaxSize) {
++            numBytesToDeliver = (fMaxSize / TRANSPORT_PACKET_SIZE) * TRANSPORT_PACKET_SIZE;
++        }
++        if (numBytesToDeliver == 0) {
++            if (fNumBytesBuffered < TRANSPORT_PACKET_SIZE) {
++                // Not even one whole TS packet yet: keep reading.
++                fillBuffer();
++                return;
++            }
++            // The client asked for less than one TS packet (not the case for the TS demuxer,
++            // whose smallest request is a multiple of 188).  Pass the data through unchanged
++            // rather than stalling; this degrades to the previous behaviour.
++            numBytesToDeliver = fNumBytesBuffered < fMaxSize ? fNumBytesBuffered : fMaxSize;
++        }
++
++        memmove(fTo, fBuffer, numBytesToDeliver);
++
++        // Keep the not-yet-delivered remainder at the front of our buffer.
++        fNumBytesBuffered -= numBytesToDeliver;
++        if (fNumBytesBuffered > 0) {
++            memmove(fBuffer, fBuffer + numBytesToDeliver, fNumBytesBuffered);
++        }
++
++        fFrameSize = numBytesToDeliver;
++        fPresentationTime = fCurPresentationTime;
++        FramedSource::afterGetting(this);
++    }
++
++    void doStopGettingFrames()
++    {
++        FramedFilter::doStopGettingFrames();
++        fNumBytesBuffered = 0;
++    }
++
++private:
++    unsigned char* fBuffer;
++    unsigned fNumBytesBuffered;
++    struct timeval fCurPresentationTime;
++};
++
+ StreamPuller::StreamPuller() : exit(1), authenticator(NULL)
+ {
+     videoCallback = [this](AVPacket* packet)
+@@ -331,7 +462,10 @@ void StreamPuller::runRTP()
+ 
+     if (payloadType == 33) {
+         source = MPEG2TransportStreamSource::createNew(*environment, &rtpSocket, payloadType);
+-        demuxer = MPEG2TransportStreamDemux::createNew(*environment, source,
++        // Re-chunk to whole TS packets so the demuxer's StreamParser bank never overflows
++        // (see TSFrameAlignSource).  Without this, ~24 bytes are dropped every ~133 packets.
++        FramedSource* tsAlign = TSFrameAlignSource::createNew(*environment, source);
++        demuxer = MPEG2TransportStreamDemux::createNew(*environment, tsAlign,
+             [](PIDState_STREAM* pidState, StreamType& streamType, void* clientData)
+             {
+                 ((StreamPuller*) clientData)->createTransportStream(pidState, streamType);
+diff --git a/thirdparty/ffmpeg/Android/include b/thirdparty/ffmpeg/Android/include
+deleted file mode 120000
+index f5030fe..0000000
+--- a/thirdparty/ffmpeg/Android/include
++++ /dev/null
+@@ -1 +0,0 @@
+-../include
+\ No newline at end of file
+diff --git a/thirdparty/ffmpeg/Emscripten/include b/thirdparty/ffmpeg/Emscripten/include
+deleted file mode 120000
+index f5030fe..0000000
+--- a/thirdparty/ffmpeg/Emscripten/include
++++ /dev/null
+@@ -1 +0,0 @@
+-../include
+\ No newline at end of file
+diff --git a/thirdparty/ffmpeg/iOS/include b/thirdparty/ffmpeg/iOS/include
+deleted file mode 120000
+index f5030fe..0000000
+--- a/thirdparty/ffmpeg/iOS/include
++++ /dev/null
+@@ -1 +0,0 @@
+-../include
+\ No newline at end of file

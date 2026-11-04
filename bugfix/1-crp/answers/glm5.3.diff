@@ -1,0 +1,44 @@
+diff --git a/thirdparty/live555/liveMedia/MPEG2TransportStreamDemuxedTrack.cpp b/thirdparty/live555/liveMedia/MPEG2TransportStreamDemuxedTrack.cpp
+index 358664f..d0d7606 100644
+--- a/thirdparty/live555/liveMedia/MPEG2TransportStreamDemuxedTrack.cpp
++++ b/thirdparty/live555/liveMedia/MPEG2TransportStreamDemuxedTrack.cpp
+@@ -20,6 +20,17 @@ along with this library; if not, write to the Free Software Foundation, Inc.,
+ 
+ #include "MPEG2TransportStreamParser.hh"
+ 
++#if CRP_MODIFY
++unsigned MPEG2TransportStreamDemuxedTrack::maxFrameSize() const {
++  // One 'frame' delivered by this source is (at most) the payload of one
++  // Transport Packet. Reporting this lets downstream StreamParsers swap
++  // their banks early enough that every delivery fits; without it, a
++  // delivery into a nearly-full bank got truncated and its tail skipped,
++  // losing bytes and corrupting the elementary stream.
++  return 188; // MPEG Transport Packet size (>= any TP payload, i.e. 184)
++}
++#endif
++
+ MPEG2TransportStreamDemuxedTrack
+ ::MPEG2TransportStreamDemuxedTrack(MPEG2TransportStreamParser& ourParser, u_int16_t pid)
+   : FramedSource(ourParser.envir()),
+diff --git a/thirdparty/live555/liveMedia/MPEG2TransportStreamDemuxedTrack.hh b/thirdparty/live555/liveMedia/MPEG2TransportStreamDemuxedTrack.hh
+index c2f7065..0bc49a3 100644
+--- a/thirdparty/live555/liveMedia/MPEG2TransportStreamDemuxedTrack.hh
++++ b/thirdparty/live555/liveMedia/MPEG2TransportStreamDemuxedTrack.hh
+@@ -30,6 +30,17 @@ public:
+   MPEG2TransportStreamDemuxedTrack(class MPEG2TransportStreamParser& ourParser, u_int16_t pid);
+   virtual ~MPEG2TransportStreamDemuxedTrack();
+ 
++#if CRP_MODIFY
++  virtual unsigned maxFrameSize() const;
++      // Returns the maximum size that a 'frame' (one Transport Packet's
++      // payload) can be.  Downstream StreamParsers use this to make sure
++      // their banks always have room for a complete delivery - otherwise
++      // the delivering parser would truncate (and silently drop) the tail
++      // of Transport Packet payloads whenever the reader's bank was nearly
++      // full, corrupting the elementary stream (missing 4..180 bytes per
++      // bank fill).
++#endif
++
+ private:
+   // redefined virtual functions:
+   virtual void doGetNextFrame();

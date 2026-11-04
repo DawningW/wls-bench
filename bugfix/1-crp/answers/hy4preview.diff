@@ -1,0 +1,52 @@
+diff --git a/thirdparty/live555/liveMedia/MPEG2TransportStreamDemuxedTrack.cpp b/thirdparty/live555/liveMedia/MPEG2TransportStreamDemuxedTrack.cpp
+index 358664f..f205533 100644
+--- a/thirdparty/live555/liveMedia/MPEG2TransportStreamDemuxedTrack.cpp
++++ b/thirdparty/live555/liveMedia/MPEG2TransportStreamDemuxedTrack.cpp
+@@ -32,3 +32,8 @@ MPEG2TransportStreamDemuxedTrack::~MPEG2TransportStreamDemuxedTrack() {
+ void MPEG2TransportStreamDemuxedTrack::doGetNextFrame() {
+   fOurParser.continueParsing();
+ }
++
++unsigned MPEG2TransportStreamDemuxedTrack::maxFrameSize() const {
++  // A single read delivers (at most) the payload of one Transport Stream packet:
++  return MAX_TS_PACKET_PAYLOAD_SIZE;
++}
+diff --git a/thirdparty/live555/liveMedia/MPEG2TransportStreamDemuxedTrack.hh b/thirdparty/live555/liveMedia/MPEG2TransportStreamDemuxedTrack.hh
+index c2f7065..8010e30 100644
+--- a/thirdparty/live555/liveMedia/MPEG2TransportStreamDemuxedTrack.hh
++++ b/thirdparty/live555/liveMedia/MPEG2TransportStreamDemuxedTrack.hh
+@@ -33,6 +33,13 @@ public:
+ private:
+   // redefined virtual functions:
+   virtual void doGetNextFrame();
++  virtual unsigned maxFrameSize() const;
++      // The maximum amount of data that we can deliver in one read is
++      // the payload of a single (186-byte-payload) Transport Stream packet:
++      // 188 - 4 (header) = 184 bytes.  Declaring this allows a downstream
++      // "StreamParser" to keep enough space in its buffer for a full
++      // delivery, avoiding truncation (and thus data loss).
++  enum { MAX_TS_PACKET_PAYLOAD_SIZE = 188 - 4 };
+ 
+ private: // We are accessed only by "MPEG2TransportStreamParser" (a friend)
+   friend class MPEG2TransportStreamParser;
+diff --git a/thirdparty/live555/liveMedia/StreamParser.cpp b/thirdparty/live555/liveMedia/StreamParser.cpp
+index 433f0ff..3e4d70c 100644
+--- a/thirdparty/live555/liveMedia/StreamParser.cpp
++++ b/thirdparty/live555/liveMedia/StreamParser.cpp
+@@ -126,7 +126,15 @@ void StreamParser::ensureValidBytes1(unsigned numBytesNeeded) {
+ 
+   // First, check whether these new bytes would overflow the current
+   // bank.  If so, start using a new bank now.
+-  if (fCurParserIndex + numBytesNeeded > BANK_SIZE) {
++  // We also swap if the remaining space in the bank is too small to hold
++  // a single maximum-sized input frame.  Otherwise, the input source would
++  // be asked to deliver a frame into a buffer smaller than the frame, which
++  // for frame-oriented sources (e.g., a demultiplexer track such as
++  // "MPEG2TransportStreamDemuxedTrack", whose consumer permanently skips
++  // any bytes that don't fit) causes data loss in the middle of the stream.
++  if (fCurParserIndex + numBytesNeeded > BANK_SIZE
++      || (BANK_SIZE - fTotNumValidBytes < maxInputFrameSize
++          && fTotNumValidBytes - fSavedParserIndex + maxInputFrameSize <= BANK_SIZE)) {
+     // Swap banks, but save any still-needed bytes from the old bank:
+     unsigned numBytesToSave = fTotNumValidBytes - fSavedParserIndex;
+     unsigned char const* from = &curBank()[fSavedParserIndex];

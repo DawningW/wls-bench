@@ -1,0 +1,94 @@
+diff --git a/src/StreamPuller.cpp b/src/StreamPuller.cpp
+index ddf5819..98a0bf5 100644
+--- a/src/StreamPuller.cpp
++++ b/src/StreamPuller.cpp
+@@ -75,6 +75,12 @@ StreamPuller::StreamPuller() : exit(1), authenticator(NULL)
+     videoCallback = [this](AVPacket* packet)
+         {
+             noteLiveness();
++            // Block until the async callback thread has finished reading the previous
++            // frame's outFrame buffer.  Without this, the event-loop thread can decode
++            // the next access unit (which the framer already has buffered from a multicast
++            // burst) and overwrite outFrame while the async thread is still delivering the
++            // previous frame to the user — a data race that produces horizontal tearing.
++            callback.wait();
+             bool inited = videoDecoder->getFrame()->data[0] != nullptr;
+             if (videoDecoder->processPacket(packet))
+             {
+@@ -96,6 +102,7 @@ StreamPuller::StreamPuller() : exit(1), authenticator(NULL)
+     audioCallback = [this](AVPacket* packet)
+         {
+             noteLiveness();
++            callback.wait();
+             bool inited = audioDecoder->getFrame()->data[0] != nullptr;
+             if (audioDecoder->processPacket(packet))
+             {
+@@ -300,6 +307,24 @@ void StreamPuller::runRTP()
+     Port rtpPort(port);
+     Groupsock rtpSocket(*environment, sessionAddress, rtpPort, 1);
+ 
++    // Multicast video arrives in bursts (especially on scene changes / IDR frames), and in
++    // this player the H.264/H.265 decode runs synchronously on the live555 event-loop
++    // thread (see StreamSink::afterGettingFrame -> videoCallback). While a frame is being
++    // decoded nobody is reading the socket, so the kernel receive buffer is the only thing
++    // that absorbs the burst. live555's MultiFramedRTPSource only asks for 50 KB, which
++    // overflows on a scene change and drops the RTP packets that carry the middle of a
++    // frame; the resulting gap in the MPEG-TS / H.264 byte stream is exactly what produces
++    // the "cbp too large" / "out of range intra chroma pred mode" / "concealing N errors"
++    // decoder messages and the on-screen tearing. VLC does not show this because it drains
++    // the socket on a dedicated thread and uses a much larger buffer. Ask for a generous
++    // buffer here so the burst fits even while the event loop is briefly busy decoding.
++    // increaseReceiveBufferTo() only ever grows the buffer, so the 50 KB request made later
++    // inside MultiFramedRTPSource's constructor becomes a no-op.
++    {
++        unsigned granted = increaseReceiveBufferTo(*environment, rtpSocket.socketNum(), 2 * 1024 * 1024);
++        *environment << "RTP socket receive buffer: " << granted << " bytes\n";
++    }
++
+     unsigned char payloadType = 0;
+     FramedSource* source = NULL;
+     demuxer = NULL;
+@@ -337,6 +362,13 @@ void StreamPuller::runRTP()
+                 ((StreamPuller*) clientData)->createTransportStream(pidState, streamType);
+             }, this, NULL, NULL);
+     } else if (payloadType >= 96 && payloadType <= 99) {
++        // H264VideoRTPSource already delivers clean, reassembled NAL units (one per
++        // getNextFrame() call). StreamSink prepends an Annex-B start code to each of them
++        // before handing them to the decoder, and the decoder's own NAL scanner
++        // (H264VideoDecoder::processPacket) reassembles SPS/PPS/IDR and slice NALs into
++        // frames. Do NOT insert an H264VideoStreamFramer here: the framer expects a
++        // continuous Annex-B byte stream (as the MPEG-TS path provides) and would never
++        // find frame boundaries in bare NAL units, causing the pipeline to stall.
+         source = H264VideoRTPSource::createNew(*environment, &rtpSocket, payloadType);
+ 
+         const char* codecName = "H264"; // only support H.264 now
+diff --git a/thirdparty/live555/liveMedia/StreamParser.cpp b/thirdparty/live555/liveMedia/StreamParser.cpp
+index 433f0ff..f32e93d 100644
+--- a/thirdparty/live555/liveMedia/StreamParser.cpp
++++ b/thirdparty/live555/liveMedia/StreamParser.cpp
+@@ -126,7 +126,25 @@ void StreamParser::ensureValidBytes1(unsigned numBytesNeeded) {
+ 
+   // First, check whether these new bytes would overflow the current
+   // bank.  If so, start using a new bank now.
++#if CRP_MODIFY
++  // BUG FIX: The original condition tested the *read* cursor (fCurParserIndex),
++  // but new data from the input source is appended at the *write* cursor
++  // (fTotNumValidBytes) — see the getNextFrame() call below.  When the parser
++  // has read a chunk but not yet consumed all of it, fTotNumValidBytes can be
++  // close to BANK_SIZE while fCurParserIndex is not, so the original check
++  // fails to trigger the swap.  maxNumBytesToRead (= BANK_SIZE - fTotNumValidBytes)
++  // then shrinks below the input source's maxFrameSize(), and the upstream source
++  // (e.g. MultiFramedRTPSource delivering a 1316-byte TS-over-RTP payload) silently
++  // truncates its delivery.  Those truncated bytes are TS packets that carry the
++  // middle of an H.264 frame; losing them corrupts the elementary stream and
++  // produces decoder errors like "cbp too large" / "out of range intra chroma
++  // pred mode" / "concealing N errors".  Test the write cursor instead so the
++  // bank is always compacted before the read, guaranteeing room for a full
++  // input frame.
++  if (fTotNumValidBytes + numBytesNeeded > BANK_SIZE) {
++#else
+   if (fCurParserIndex + numBytesNeeded > BANK_SIZE) {
++#endif
+     // Swap banks, but save any still-needed bytes from the old bank:
+     unsigned numBytesToSave = fTotNumValidBytes - fSavedParserIndex;
+     unsigned char const* from = &curBank()[fSavedParserIndex];
