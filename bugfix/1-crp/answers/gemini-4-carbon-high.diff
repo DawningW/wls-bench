@@ -1,0 +1,667 @@
+diff --git a/src/StreamPuller.cpp b/src/StreamPuller.cpp
+index ddf5819..9e6e895 100644
+--- a/src/StreamPuller.cpp
++++ b/src/StreamPuller.cpp
+@@ -1,6 +1,7 @@
+ #include "StreamPuller.h"
+ #include <cstdio>
+ #include <cstring>
++#include <vector>
+ #include <unordered_map>
+ #include <regex>
+ #ifdef __EMSCRIPTEN__
+@@ -30,7 +31,7 @@
+ #define DEFAULT_TIMEOUT_MS 1000
+ 
+ static const std::string USER_AGENT = std::string("CoralReefPlayer/") + crp_version_str();
+-static const unsigned MAX_TS_FRAME_SIZE = 7 * TRANSPORT_PACKET_SIZE;
++static const unsigned MAX_TS_FRAME_SIZE = 36 * TRANSPORT_PACKET_SIZE;
+ 
+ class OurRTSPClient : public RTSPClient
+ {
+@@ -299,32 +300,44 @@ void StreamPuller::runRTP()
+     copyAddress(sessionAddress, sessionAddresses.firstAddress());
+     Port rtpPort(port);
+     Groupsock rtpSocket(*environment, sessionAddress, rtpPort, 1);
++    increaseReceiveBufferTo(*environment, rtpSocket.socketNum(), 2 * 1024 * 1024);
+ 
+     unsigned char payloadType = 0;
+     FramedSource* source = NULL;
+     demuxer = NULL;
+     MediaSink *sink = NULL;
+     {
+-        unsigned char packet[1500];
+-        unsigned packetSize;
++        std::vector<unsigned char> packet(65536);
++        unsigned packetSize = 0;
+         struct sockaddr_storage fromAddress;
+         *environment << "Waiting for first RTP packet to determine payload type...\n";
+ 
+-        available = 0;
+-        environment->taskScheduler().setBackgroundHandling(rtpSocket.socketNum(), SOCKET_READABLE,
+-            [](void* clientData, int mask)
++        while (!exit)
++        {
++            available = 0;
++            environment->taskScheduler().setBackgroundHandling(rtpSocket.socketNum(), SOCKET_READABLE,
++                [](void* clientData, int mask)
++                {
++                    ((StreamPuller*) clientData)->available = 1;
++                }, this);
++            if (exit)
+             {
+-                ((StreamPuller*) clientData)->available = 1;
+-            }, this);
+-        environment->taskScheduler().doEventLoop(&available);
+-        environment->taskScheduler().disableBackgroundHandling(rtpSocket.socketNum());
+-        if (exit) goto end;
+-
+-        if (!rtpSocket.handleRead(packet, sizeof(packet), packetSize, fromAddress)) {
+-            *environment << "Failed to read RTP packet\n";
+-            callback.invokeSync(CRP_EV_ERROR, (void*) 0, userData);
+-            goto end;
++                environment->taskScheduler().disableBackgroundHandling(rtpSocket.socketNum());
++                goto end;
++            }
++            environment->taskScheduler().doEventLoop(&available);
++            environment->taskScheduler().disableBackgroundHandling(rtpSocket.socketNum());
++            if (exit) goto end;
++
++            if (!rtpSocket.handleRead(packet.data(), packet.size(), packetSize, fromAddress)) {
++                *environment << "Failed to read RTP packet\n";
++                callback.invokeSync(CRP_EV_ERROR, (void*) 0, userData);
++                goto end;
++            }
++            if (packetSize >= 12 && (packet[0] & 0xC0) == 0x80)
++                break;
+         }
++        if (exit) goto end;
+ 
+         payloadType = packet[1] & 0x7F;
+     }
+@@ -336,7 +349,7 @@ void StreamPuller::runRTP()
+             {
+                 ((StreamPuller*) clientData)->createTransportStream(pidState, streamType);
+             }, this, NULL, NULL);
+-    } else if (payloadType >= 96 && payloadType <= 99) {
++    } else if (payloadType >= 96 && payloadType <= 127) {
+         source = H264VideoRTPSource::createNew(*environment, &rtpSocket, payloadType);
+ 
+         const char* codecName = "H264"; // only support H.264 now
+@@ -355,9 +368,9 @@ void StreamPuller::runRTP()
+     callback.invokeSync(CRP_EV_PLAYING, nullptr, userData);
+     environment->taskScheduler().doEventLoop(&exit);
+ 
++    Medium::close(demuxer);
+     Medium::close(sink);
+     Medium::close(source);
+-    Medium::close(demuxer);
+ end:
+     delete scheduler;
+ }
+@@ -962,13 +975,15 @@ void StreamPuller::createTransportStream(PIDState_STREAM *pidState, StreamType &
+                             STREAM_TYPE_CODEC_MAP.at(pidState->stream_type) : "";
+ 
+     FramedSource *inputSource = pidState->streamSource;
+-    if (streamType.dataType == StreamType::VIDEO)
++    if (streamType.dataType == StreamType::VIDEO && videoDecoder == nullptr)
+     {
+         videoDecoder = VideoDecoder::createNew(codecName,
+             (Format) option.video.format, option.video.width, option.video.height, option.video.hw_device);
+         if (videoDecoder == nullptr)
+         {
+             env << "Not support video codec: " << streamType.description << "\n";
++            Medium::close(pidState->streamSource);
++            pidState->streamSource = NULL;
+             return;
+         }
+ 
+@@ -986,6 +1001,8 @@ void StreamPuller::createTransportStream(PIDState_STREAM *pidState, StreamType &
+     else
+     {
+         env << "Not support medium: " << mediumName << "\n";
++        Medium::close(pidState->streamSource);
++        pidState->streamSource = NULL;
+         return;
+     }
+ 
+diff --git a/src/StreamSink.cpp b/src/StreamSink.cpp
+index 6b04d0e..76200f2 100644
+--- a/src/StreamSink.cpp
++++ b/src/StreamSink.cpp
+@@ -1,9 +1,11 @@
+ #include "StreamSink.h"
+ #include <cstdio>
+ #include <cstring>
++#include "RTPSource.hh"
++#include "MPEGVideoStreamFramer.hh"
+ #include "VideoDecoder.h"
+ 
+-#define SINK_RECEIVE_BUFFER_SIZE 1000000
++#define SINK_RECEIVE_BUFFER_SIZE (4 * 1024 * 1024)
+ #define HTTP_RECEIVE_BUFFER_SIZE 1500000
+ 
+ StreamSink* StreamSink::createNew(UsageEnvironment& env, const char *mediumName, const char *codecName, Callback callback)
+@@ -12,11 +14,15 @@ StreamSink* StreamSink::createNew(UsageEnvironment& env, const char *mediumName,
+ }
+ 
+ StreamSink::StreamSink(UsageEnvironment& env, const char *mediumName, const char *codecName, Callback callback)
+-    : MediaSink(env), fMediumName(mediumName), fCodecName(codecName), fCallback(callback)
++    : MediaSink(env), fReceiveBuffer(nullptr), fMediumName(mediumName), fCodecName(codecName), fCallback(callback),
++      fIsH264(False), fIsH265(False), fH264OrH265(False),
++      fBufferPos(0), fHasVCL(False), fHasRTPTimestamp(False), fLastRTPTimestamp(0), fLastPresentationTime{0, 0}
+ {
+-    fReceiveBuffer = new u_int8_t[SINK_RECEIVE_BUFFER_SIZE];
++    fReceiveBuffer = new u_int8_t[SINK_RECEIVE_BUFFER_SIZE + AV_INPUT_BUFFER_PADDING_SIZE]();
+     memcpy(fReceiveBuffer, startCode4, sizeof(startCode4));
+-    fH264OrH265 = strcmp(codecName, "H264") == 0 || strcmp(codecName, "H265") == 0;
++    fIsH264 = strcmp(codecName, "H264") == 0;
++    fIsH265 = strcmp(codecName, "H265") == 0;
++    fH264OrH265 = fIsH264 || fIsH265;
+ }
+ 
+ StreamSink::~StreamSink()
+@@ -24,6 +30,27 @@ StreamSink::~StreamSink()
+     delete[] fReceiveBuffer;
+ }
+ 
++void StreamSink::flushAccessUnit(struct timeval presentationTime)
++{
++    if (fBufferPos == 0)
++        return;
++
++    uint8_t savedPadding[AV_INPUT_BUFFER_PADDING_SIZE];
++    memcpy(savedPadding, fReceiveBuffer + fBufferPos, AV_INPUT_BUFFER_PADDING_SIZE);
++    memset(fReceiveBuffer + fBufferPos, 0, AV_INPUT_BUFFER_PADDING_SIZE);
++
++    AVPacket packet{};
++    packet.data = fReceiveBuffer;
++    packet.size = fBufferPos;
++    packet.pts = (int64_t) presentationTime.tv_sec * 1000 + presentationTime.tv_usec / 1000;
++    packet.dts = AV_NOPTS_VALUE;
++    fCallback(&packet);
++
++    memcpy(fReceiveBuffer + fBufferPos, savedPadding, AV_INPUT_BUFFER_PADDING_SIZE);
++    fBufferPos = 0;
++    fHasVCL = False;
++}
++
+ void StreamSink::afterGettingFrame(void* clientData, unsigned frameSize, unsigned numTruncatedBytes,
+     struct timeval presentationTime, unsigned durationInMicroseconds)
+ {
+@@ -39,22 +66,121 @@ void StreamSink::afterGettingFrame(unsigned frameSize, unsigned numTruncatedByte
+     envir() << "\n";
+ #endif
+ 
+-    uint8_t* buffer = fReceiveBuffer + 4;
+-    if (fH264OrH265)
++    if (!fH264OrH265)
+     {
+-        if ((memcmp(buffer, startCode4, sizeof(startCode4)) != 0 &&
+-            memcmp(buffer, startCode3, sizeof(startCode3)) != 0))
++        AVPacket packet{};
++        packet.data = fReceiveBuffer + 4;
++        packet.size = frameSize;
++        packet.pts = (int64_t) presentationTime.tv_sec * 1000 + presentationTime.tv_usec / 1000;
++        packet.dts = AV_NOPTS_VALUE;
++        fCallback(&packet);
++
++        if (!continuePlaying())
++            onSourceClosure(this);
++        return;
++    }
++
++    if (frameSize > 0)
++    {
++        uint8_t* nalStart = fReceiveBuffer + fBufferPos;
++        uint8_t* nalPayload = nalStart + 4;
++        unsigned nalTotalSize = frameSize + 4;
++        unsigned startCodeLen = 4;
++
++        if (frameSize >= 4 && memcmp(nalPayload, startCode4, sizeof(startCode4)) == 0)
+         {
+-            buffer -= 4;
+-            frameSize += 4;
++            memmove(nalStart, nalPayload, frameSize);
++            nalTotalSize = frameSize;
++            startCodeLen = 4;
++        }
++        else if (frameSize >= 3 && memcmp(nalPayload, startCode3, sizeof(startCode3)) == 0)
++        {
++            memmove(nalStart, nalPayload, frameSize);
++            nalTotalSize = frameSize;
++            startCodeLen = 3;
++        }
++
++        bool isVCL = false;
++        bool isFirstSliceOfPic = false;
++        bool usuallyBeginsAU = false;
++        if (nalTotalSize > startCodeLen)
++        {
++            uint8_t nalHeader = nalStart[startCodeLen];
++            if (fIsH264)
++            {
++                uint8_t nalType = nalHeader & 0x1F;
++                isVCL = (nalType >= 1 && nalType <= 5);
++                usuallyBeginsAU = (nalType >= 6 && nalType <= 9) || (nalType >= 14 && nalType <= 18);
++                if ((nalType == 1 || nalType == 5) && nalTotalSize > startCodeLen + 1)
++                {
++                    isFirstSliceOfPic = (nalStart[startCodeLen + 1] & 0x80) != 0;
++                }
++            }
++            else
++            {
++                uint8_t nalType = (nalHeader & 0x7E) >> 1;
++                isVCL = (nalType <= 31);
++                usuallyBeginsAU = (nalType >= 32 && nalType <= 35) || (nalType == 39);
++                if (isVCL && nalTotalSize > startCodeLen + 2)
++                {
++                    isFirstSliceOfPic = (nalStart[startCodeLen + 2] & 0x80) != 0;
++                }
++            }
++        }
++
++        if (fSource != NULL && fSource->isRTPSource())
++        {
++            RTPSource* rtpSource = (RTPSource*) fSource;
++            u_int32_t curRTPTimestamp = rtpSource->curPacketRTPTimestamp();
++            Boolean markerBit = rtpSource->curPacketMarkerBit();
++
++            bool newAccessUnit = (fHasRTPTimestamp && curRTPTimestamp != fLastRTPTimestamp) ||
++                                 (fHasVCL && (isFirstSliceOfPic || usuallyBeginsAU));
++            if (newAccessUnit && fHasVCL)
++            {
++                flushAccessUnit(fLastPresentationTime);
++                memmove(fReceiveBuffer, nalStart, nalTotalSize);
++            }
++
++            fBufferPos += nalTotalSize;
++            if (isVCL)
++                fHasVCL = True;
++            fLastRTPTimestamp = curRTPTimestamp;
++            fHasRTPTimestamp = True;
++            fLastPresentationTime = presentationTime;
++
++            if (markerBit && fHasVCL)
++            {
++                flushAccessUnit(presentationTime);
++            }
++        }
++        else if (fSource != NULL && (fSource->isH264VideoStreamFramer() || fSource->isH265VideoStreamFramer()))
++        {
++            MPEGVideoStreamFramer* framer = (MPEGVideoStreamFramer*) fSource;
++            Boolean endOfAU = framer->pictureEndMarker();
++
++            if (fHasVCL && (isFirstSliceOfPic || usuallyBeginsAU))
++            {
++                flushAccessUnit(fLastPresentationTime);
++                memmove(fReceiveBuffer, nalStart, nalTotalSize);
++            }
++
++            fBufferPos += nalTotalSize;
++            if (isVCL)
++                fHasVCL = True;
++            fLastPresentationTime = presentationTime;
++
++            if (endOfAU && fHasVCL)
++            {
++                flushAccessUnit(presentationTime);
++            }
++        }
++        else
++        {
++            fBufferPos += nalTotalSize;
++            flushAccessUnit(presentationTime);
+         }
+     }
+-    AVPacket packet{};
+-    packet.data = buffer;
+-    packet.size = frameSize;
+-    packet.pts = presentationTime.tv_sec * 1000 + presentationTime.tv_usec / 1000;
+-    packet.dts = AV_NOPTS_VALUE;
+-    fCallback(&packet);
+ 
+     if (!continuePlaying())
+         onSourceClosure(this);
+@@ -75,7 +201,29 @@ Boolean StreamSink::continuePlaying()
+     if (fSource == NULL)
+         return False;
+ 
+-    fSource->getNextFrame(fReceiveBuffer + 4, SINK_RECEIVE_BUFFER_SIZE - 4, afterGettingFrame, this, onSourceClosure, this);
++    if (fH264OrH265)
++    {
++        if (fSource->isH264VideoStreamFramer() || fSource->isH265VideoStreamFramer())
++        {
++            ((MPEGVideoStreamFramer*) fSource)->pictureEndMarker() = False;
++        }
++        if (SINK_RECEIVE_BUFFER_SIZE - fBufferPos <= 65536)
++        {
++            if (fHasVCL)
++                flushAccessUnit(fLastPresentationTime);
++            else
++                fBufferPos = 0;
++        }
++        memcpy(fReceiveBuffer + fBufferPos, startCode4, sizeof(startCode4));
++        fSource->getNextFrame(fReceiveBuffer + fBufferPos + 4,
++            SINK_RECEIVE_BUFFER_SIZE - fBufferPos - 4,
++            afterGettingFrame, this, onSourceClosure, this);
++    }
++    else
++    {
++        fSource->getNextFrame(fReceiveBuffer + 4, SINK_RECEIVE_BUFFER_SIZE - 4,
++            afterGettingFrame, this, onSourceClosure, this);
++    }
+     return True;
+ }
+ 
+diff --git a/src/StreamSink.h b/src/StreamSink.h
+index e377946..c68b11b 100644
+--- a/src/StreamSink.h
++++ b/src/StreamSink.h
+@@ -28,11 +28,20 @@ protected:
+         struct timeval presentationTime, unsigned durationInMicroseconds);
+ 
+ private:
++    void flushAccessUnit(struct timeval presentationTime);
++
+     u_int8_t* fReceiveBuffer;
+     const char *fMediumName;
+     const char *fCodecName;
+     Callback fCallback;
++    Boolean fIsH264;
++    Boolean fIsH265;
+     Boolean fH264OrH265;
++    unsigned fBufferPos;
++    Boolean fHasVCL;
++    Boolean fHasRTPTimestamp;
++    u_int32_t fLastRTPTimestamp;
++    struct timeval fLastPresentationTime;
+ };
+ 
+ class SessionStreamSink : public StreamSink
+diff --git a/src/VideoDecoder.cpp b/src/VideoDecoder.cpp
+index 1c2b427..9d693de 100644
+--- a/src/VideoDecoder.cpp
++++ b/src/VideoDecoder.cpp
+@@ -6,7 +6,7 @@ extern "C"
+ #include "libavutil/imgutils.h"
+ }
+ 
+-#define EXTRADATA_MAX_SIZE (AV_INPUT_BUFFER_PADDING_SIZE * 2)
++#define EXTRADATA_MAX_SIZE 4096
+ 
+ const uint8_t startCode3[3] = { 0x00, 0x00, 0x01 };
+ const uint8_t startCode4[4] = { 0x00, 0x00, 0x00, 0x01 };
+@@ -53,7 +53,7 @@ static const AVCodec* find_hw_decoder(const std::string& codecName, const std::s
+ static bool extractH264Or5Frame(AVPacket* pkt, int& offset, int& size, int& markerSize)
+ {
+     offset += size;
+-    if (offset >= pkt->size)
++    if (offset >= pkt->size || pkt->size - offset < (int) sizeof(startCode4))
+         return false;
+     int tempOffset = offset;
+     // 两种起始码有可能混用, 所以需要同时判断
+@@ -164,7 +164,7 @@ VideoDecoder::VideoDecoder(const AVCodec* codec, AVHWDeviceType deviceType, cons
+     codecCtx->opaque = this;
+     codecCtx->flags = AV_CODEC_FLAG_LOW_DELAY;
+     //codecCtx->flags2 = AV_CODEC_FLAG2_CHUNKS; // BUG have bug when using drm on linux
+-    codecCtx->extradata = (uint8_t*) av_malloc(EXTRADATA_MAX_SIZE);
++    codecCtx->extradata = (uint8_t*) av_mallocz(EXTRADATA_MAX_SIZE + AV_INPUT_BUFFER_PADDING_SIZE);
+     codecCtx->extradata_size = 0;
+     if (deviceType != AV_HWDEVICE_TYPE_NONE)
+     {
+@@ -352,6 +352,7 @@ bool H264VideoDecoder::processPacket(AVPacket* packet)
+                     }
+                     av_dict_free(&opts);
+                     state = 3;
++                    break;
+                 }
+             }
+         }
+@@ -420,6 +421,7 @@ bool H265VideoDecoder::processPacket(AVPacket* packet)
+                     }
+                     av_dict_free(&opts);
+                     state = 4;
++                    break;
+                 }
+             }
+         }
+diff --git a/thirdparty/live555/liveMedia/BasicUDPSource.cpp b/thirdparty/live555/liveMedia/BasicUDPSource.cpp
+index 78dc14e..0e971b9 100644
+--- a/thirdparty/live555/liveMedia/BasicUDPSource.cpp
++++ b/thirdparty/live555/liveMedia/BasicUDPSource.cpp
+@@ -29,7 +29,11 @@ BasicUDPSource* BasicUDPSource::createNew(UsageEnvironment& env,
+ BasicUDPSource::BasicUDPSource(UsageEnvironment& env, Groupsock* inputGS)
+   : FramedSource(env), fInputGS(inputGS), fHaveStartedReading(False) {
+   // Try to use a large receive buffer (in the OS):
++#if CRP_MODIFY
++  increaseReceiveBufferTo(env, inputGS->socketNum(), 2*1024*1024);
++#else
+   increaseReceiveBufferTo(env, inputGS->socketNum(), 50*1024);
++#endif
+ 
+   // Make the socket non-blocking, even though it will be read from only asynchronously, when packets arrive.
+   // The reason for this is that, in some OSs, reads on a blocking socket can (allegedly) sometimes block,
+diff --git a/thirdparty/live555/liveMedia/H264VideoRTPSource.cpp b/thirdparty/live555/liveMedia/H264VideoRTPSource.cpp
+index 7b0cdb7..f34928f 100644
+--- a/thirdparty/live555/liveMedia/H264VideoRTPSource.cpp
++++ b/thirdparty/live555/liveMedia/H264VideoRTPSource.cpp
+@@ -74,10 +74,16 @@ Boolean H264VideoRTPSource
+   fCurPacketNALUnitType = (headerStart[0]&0x1F);
+   switch (fCurPacketNALUnitType) {
+   case 24: { // STAP-A
++#if CRP_MODIFY
++    fCurrentPacketBeginsFrame = fCurrentPacketCompletesFrame = True;
++#endif
+     numBytesToSkip = 1; // discard the type byte
+     break;
+   }
+   case 25: case 26: case 27: { // STAP-B, MTAP16, or MTAP24
++#if CRP_MODIFY
++    fCurrentPacketBeginsFrame = fCurrentPacketCompletesFrame = True;
++#endif
+     numBytesToSkip = 3; // discard the type byte, and the initial DON
+     break;
+   }
+diff --git a/thirdparty/live555/liveMedia/H264or5VideoStreamFramer.cpp b/thirdparty/live555/liveMedia/H264or5VideoStreamFramer.cpp
+index 02275c7..a42acf1 100644
+--- a/thirdparty/live555/liveMedia/H264or5VideoStreamFramer.cpp
++++ b/thirdparty/live555/liveMedia/H264or5VideoStreamFramer.cpp
+@@ -1074,7 +1074,9 @@ unsigned H264or5VideoStreamParser::parse() {
+       }
+     }
+ 
++#if !CRP_MODIFY
+     fHaveSeenFirstByteOfNALUnit = False; // for the next NAL unit that we'll parse
++#endif
+     u_int8_t nal_unit_type;
+     if (fHNumber == 264) {
+       nal_unit_type = fFirstByteOfNALUnit&0x1F;
+@@ -1183,6 +1185,9 @@ unsigned H264or5VideoStreamParser::parse() {
+       }
+     }
+ 	
++#if CRP_MODIFY
++    usingSource()->fPictureEndMarker = thisNALUnitEndsAccessUnit;
++#endif
+     if (thisNALUnitEndsAccessUnit) {
+ #ifdef DEBUG
+       fprintf(stderr, "*****This NAL unit ends the current access unit*****\n");
+@@ -1198,6 +1203,9 @@ unsigned H264or5VideoStreamParser::parse() {
+       nextPT.tv_sec += (long)nextSecsIncrement;
+       nextPT.tv_usec = (long)((nextFraction - nextSecsIncrement)*1000000);
+     }
++#if CRP_MODIFY
++    fHaveSeenFirstByteOfNALUnit = False; // for the next NAL unit that we'll parse
++#endif
+     setParseState();
+ 
+     return curFrameSize();
+diff --git a/thirdparty/live555/liveMedia/H265VideoRTPSource.cpp b/thirdparty/live555/liveMedia/H265VideoRTPSource.cpp
+index 2de5a1d..e4d68ef 100644
+--- a/thirdparty/live555/liveMedia/H265VideoRTPSource.cpp
++++ b/thirdparty/live555/liveMedia/H265VideoRTPSource.cpp
+@@ -78,6 +78,9 @@ Boolean H265VideoRTPSource
+   fCurPacketNALUnitType = (headerStart[0]&0x7E)>>1;
+   switch (fCurPacketNALUnitType) {
+   case 48: { // Aggregation Packet (AP)
++#if CRP_MODIFY
++    fCurrentPacketBeginsFrame = fCurrentPacketCompletesFrame = True;
++#endif
+     // We skip over the 2-byte Payload Header, and the DONL header (if any).
+     if (fExpectDONFields) {
+       if (packetSize < 4) return False;
+diff --git a/thirdparty/live555/liveMedia/MPEG2TransportStreamDemuxedTrack.hh b/thirdparty/live555/liveMedia/MPEG2TransportStreamDemuxedTrack.hh
+index c2f7065..d309229 100644
+--- a/thirdparty/live555/liveMedia/MPEG2TransportStreamDemuxedTrack.hh
++++ b/thirdparty/live555/liveMedia/MPEG2TransportStreamDemuxedTrack.hh
+@@ -33,6 +33,9 @@ public:
+ private:
+   // redefined virtual functions:
+   virtual void doGetNextFrame();
++#if CRP_MODIFY
++  virtual unsigned maxFrameSize() const { return 188; }
++#endif
+ 
+ private: // We are accessed only by "MPEG2TransportStreamParser" (a friend)
+   friend class MPEG2TransportStreamParser;
+diff --git a/thirdparty/live555/liveMedia/MPEG2TransportStreamParser_STREAM.cpp b/thirdparty/live555/liveMedia/MPEG2TransportStreamParser_STREAM.cpp
+index 8e83b2b..5cef960 100644
+--- a/thirdparty/live555/liveMedia/MPEG2TransportStreamParser_STREAM.cpp
++++ b/thirdparty/live555/liveMedia/MPEG2TransportStreamParser_STREAM.cpp
+@@ -285,7 +285,11 @@ unsigned MPEG2TransportStreamParser
+ PIDState_STREAM::PIDState_STREAM(MPEG2TransportStreamParser& parser,
+ 				 u_int16_t pid, u_int16_t programNumber, u_int8_t streamType)
+   : PIDState(parser, pid, STREAM),
+-    program_number(programNumber), stream_type(streamType), lastSeenPTS(0.0) {
++    program_number(programNumber), stream_type(streamType), lastSeenPTS(0.0)
++#if CRP_MODIFY
++    , streamSource(NULL), streamSink(NULL)
++#endif
++{
+   // Create the 'source' and 'sink' objects for this track, and 'start playing' them:
+   streamSource = new MPEG2TransportStreamDemuxedTrack(parser, pid);
+ 
+diff --git a/thirdparty/live555/liveMedia/MediaSession.cpp b/thirdparty/live555/liveMedia/MediaSession.cpp
+index ce2e9a7..2913a31 100644
+--- a/thirdparty/live555/liveMedia/MediaSession.cpp
++++ b/thirdparty/live555/liveMedia/MediaSession.cpp
+@@ -841,8 +841,13 @@ Boolean MediaSubsession::initiate(int useSpecialRTPoffset) {
+     // Try to use a big receive buffer for RTP - at least 0.1 second of
+     // specified bandwidth and at least 50 KB
+     unsigned rtpBufSize = fBandwidth * 25 / 2; // 1 kbps * 0.1 s = 12.5 bytes
++#if CRP_MODIFY
++    if (rtpBufSize < 2 * 1024 * 1024)
++      rtpBufSize = 2 * 1024 * 1024;
++#else
+     if (rtpBufSize < 50 * 1024)
+       rtpBufSize = 50 * 1024;
++#endif
+     increaseReceiveBufferTo(env(), fRTPSocket->socketNum(), rtpBufSize);
+ 
+     if (isSSM() && fRTCPSocket != NULL) {
+diff --git a/thirdparty/live555/liveMedia/MultiFramedRTPSource.cpp b/thirdparty/live555/liveMedia/MultiFramedRTPSource.cpp
+index a0098a1..c22e177 100644
+--- a/thirdparty/live555/liveMedia/MultiFramedRTPSource.cpp
++++ b/thirdparty/live555/liveMedia/MultiFramedRTPSource.cpp
+@@ -73,7 +73,11 @@ MultiFramedRTPSource
+   fReorderingBuffer = new ReorderingPacketBuffer(packetFactory);
+ 
+   // Try to use a big receive buffer for RTP:
++#if CRP_MODIFY
++  increaseReceiveBufferTo(env, RTPgs->socketNum(), 2*1024*1024);
++#else
+   increaseReceiveBufferTo(env, RTPgs->socketNum(), 50*1024);
++#endif
+ }
+ 
+ void MultiFramedRTPSource::reset() {
+@@ -186,6 +190,11 @@ void MultiFramedRTPSource::doGetNextFrame1() {
+     if (!nextPacket->hasUsableData()) {
+       // We're completely done with this packet now
+       fReorderingBuffer->releaseUsedPacket(nextPacket);
++#if CRP_MODIFY
++    } else {
++      // More enclosed frames remain in this packet; the RTP marker bit applies only to the last one
++      fCurPacketMarkerBit = False;
++#endif
+     }
+ 
+     if (fCurrentPacketCompletesFrame && fFrameSize > 0) {
+@@ -227,6 +236,12 @@ void MultiFramedRTPSource::networkReadHandler(MultiFramedRTPSource* source, int
+ }
+ 
+ void MultiFramedRTPSource::networkReadHandler1() {
++#if CRP_MODIFY && !defined(__EMSCRIPTEN__)
++  Boolean const isUDP = fRTPInterface.gs() != NULL && fRTPInterface.gs()->socketNum() >= 0;
++  unsigned maxReads = isUDP ? 512 : 1;
++  while (maxReads-- > 0) {
++    Boolean noMorePackets = False;
++#endif
+   BufferedPacket* bPacket = fPacketReadInProgress;
+   if (bPacket == NULL) {
+     // Normal case: Get a free BufferedPacket descriptor to hold the new network packet:
+@@ -243,6 +258,9 @@ void MultiFramedRTPSource::networkReadHandler1() {
+ 	envir() << "MultiFramedRTPSource internal error: Hit limit when reading incoming packet over TCP\n";
+       }
+       fPacketReadInProgress = NULL;
++#if CRP_MODIFY && !defined(__EMSCRIPTEN__)
++      noMorePackets = True;
++#endif
+       break;
+     }
+     if (packetReadWasIncomplete) {
+@@ -252,6 +270,12 @@ void MultiFramedRTPSource::networkReadHandler1() {
+     } else {
+       fPacketReadInProgress = NULL;
+     }
++#if CRP_MODIFY && !defined(__EMSCRIPTEN__)
++    if (isUDP && bPacket->dataSize() == 0) {
++      noMorePackets = True;
++      break;
++    }
++#endif
+ #ifdef TEST_LOSS
+     setPacketReorderingThresholdTime(0);
+        // don't wait for 'lost' packets to arrive out-of-order later
+@@ -341,6 +365,10 @@ void MultiFramedRTPSource::networkReadHandler1() {
+     readSuccess = True;
+   } while (0);
+   if (!readSuccess) fReorderingBuffer->freePacket(bPacket);
++#if CRP_MODIFY && !defined(__EMSCRIPTEN__)
++    if (noMorePackets) break;
++  }
++#endif
+ 
+   doGetNextFrame1();
+   // If we didn't get proper data this time, we'll get another chance
+diff --git a/thirdparty/live555/liveMedia/StreamParser.cpp b/thirdparty/live555/liveMedia/StreamParser.cpp
+index 433f0ff..896d772 100644
+--- a/thirdparty/live555/liveMedia/StreamParser.cpp
++++ b/thirdparty/live555/liveMedia/StreamParser.cpp
+@@ -126,7 +126,11 @@ void StreamParser::ensureValidBytes1(unsigned numBytesNeeded) {
+ 
+   // First, check whether these new bytes would overflow the current
+   // bank.  If so, start using a new bank now.
++#if CRP_MODIFY
++  if (fCurParserIndex + numBytesNeeded > BANK_SIZE || fTotNumValidBytes + maxInputFrameSize > BANK_SIZE) {
++#else
+   if (fCurParserIndex + numBytesNeeded > BANK_SIZE) {
++#endif
+     // Swap banks, but save any still-needed bytes from the old bank:
+     unsigned numBytesToSave = fTotNumValidBytes - fSavedParserIndex;
+     unsigned char const* from = &curBank()[fSavedParserIndex];
+diff --git a/thirdparty/live555/liveMedia/include/RTPSource.hh b/thirdparty/live555/liveMedia/include/RTPSource.hh
+index d17db7c..92a627a 100644
+--- a/thirdparty/live555/liveMedia/include/RTPSource.hh
++++ b/thirdparty/live555/liveMedia/include/RTPSource.hh
+@@ -86,7 +86,9 @@ public:
+   // RTP sequence numbers and timestamps are usually not useful to receivers.
+   // (Our implementation of RTP reception already does all needed handling of RTP sequence numbers and timestamps.)
+   u_int16_t curPacketRTPSeqNum() const { return fCurPacketRTPSeqNum; }
++#if !CRP_MODIFY
+ private: friend class MediaSubsession; // "MediaSubsession" is the only outside class that ever needs to see RTP timestamps!
++#endif
+   u_int32_t curPacketRTPTimestamp() const { return fCurPacketRTPTimestamp; }
+ 
+ protected:

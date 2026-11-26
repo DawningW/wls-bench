@@ -1,0 +1,29 @@
+diff --git a/thirdparty/live555/liveMedia/MPEG2TransportStreamDemuxedTrack.cpp b/thirdparty/live555/liveMedia/MPEG2TransportStreamDemuxedTrack.cpp
+index 358664f..a7feefd 100644
+--- a/thirdparty/live555/liveMedia/MPEG2TransportStreamDemuxedTrack.cpp
++++ b/thirdparty/live555/liveMedia/MPEG2TransportStreamDemuxedTrack.cpp
+@@ -20,10 +20,24 @@ along with this library; if not, write to the Free Software Foundation, Inc.,
+ 
+ #include "MPEG2TransportStreamParser.hh"
+ 
++#ifndef TRANSPORT_PACKET_SIZE
++#define TRANSPORT_PACKET_SIZE 188
++#endif
++
+ MPEG2TransportStreamDemuxedTrack
+ ::MPEG2TransportStreamDemuxedTrack(MPEG2TransportStreamParser& ourParser, u_int16_t pid)
+   : FramedSource(ourParser.envir()),
+     fOurParser(ourParser), fPID(pid) {
++#if CRP_MODIFY
++  // Each delivery is the payload of a single Transport Stream packet (at most 188-4 bytes), and
++  // "MPEG2TransportStreamParser::processStreamPacket()" silently truncates (drops) whatever doesn't
++  // fit into the reader's buffer. Readers based on "StreamParser" (e.g. H264VideoStreamFramer)
++  // only swap their bank before it gets too full if the source tells them its maximum frame size;
++  // with the default (0) they keep reading into the few bytes left at the end of the bank, so
++  // a part of a TS packet's payload was lost about every BANK_SIZE (150 KB) of ES data,
++  // corrupting the video (mosaic / torn pictures until the next IDR).
++  setMaxFrameSize(TRANSPORT_PACKET_SIZE);
++#endif
+ }
+ 
+ MPEG2TransportStreamDemuxedTrack::~MPEG2TransportStreamDemuxedTrack() {

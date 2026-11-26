@@ -30,6 +30,14 @@
 |XiaoMi Mimo 2.6 Pro|×|
 |HY 4|部分正确|
 |Step 5|×|
+|Gemini 4 Hydrogen (XHigh)|部分正确(纯静态无工具测试：结论与字节码机理正确，2轮一致，未命中kotlinc仅消除命中后分支的细节)|
+|Gemini 4 Hydrogen (Medium)|部分正确(纯静态无工具测试：结论与字节码机理正确，未命中kotlinc仅消除命中后分支的细节)|
+|Gemini 4 Hydrogen (Low)|×|
+|Gemini 4 Neon (XHigh)|部分正确(纯静态无工具测试：结论与字节码机理正确，2轮一致，未命中kotlinc仅消除命中后分支的细节)|
+|Gemini 4 Neon (Medium)|部分正确(纯静态无工具测试：结论与字节码机理正确，未命中kotlinc仅消除命中后分支的细节)|
+|Gemini 4 Carbon (High)|部分正确(纯静态无工具测试：结论与字节码机理正确，2轮一致，未命中kotlinc仅消除命中后分支的细节)|
+|Claude Opus 5.5 (High)|部分正确(纯静态无工具测试：结论正确，但对kotlinc仅消基本类型分支与装箱的机制判断有偏差)|
+|Claude Sonnet 5.5 (High)|部分正确(纯静态无工具测试：结论与机理正确，追问后主动纠正模糊表述并注明需kotlinc实测)|
 
 ## 许愿式编程
 
@@ -69,6 +77,14 @@
 |XiaoMi Mimo 2.6 Pro|3.0/5.0(侵入式修改+无关修改，且雷霆大思考，非常慢)|
 |HY 4 preview|4.0/5.0(找到了根因，但是有对live555的侵入式修改)|
 |Step 5|4.5/5.0(核心改动与我完全一致，但是有对live555的侵入式修改)|
+|Gemini 4 Hydrogen (XHigh)|3.5/5.0(阶段1纯静态找到根因，但有对live555的侵入式修改且改了大量无关代码)|
+|Gemini 4 Hydrogen (Medium)|3.5/5.0(阶段1未找出根因，阶段2离线调试定位，有对live555的侵入式修改且保留了阶段1的UDP缓冲无关改动)|
+|Gemini 4 Hydrogen (Low)|0.0/5.0(三阶段均未找出根因，仅调大UDP接收缓冲，并将解码报错日志误判为正常)|
+|Gemini 4 Neon (XHigh)|3.5/5.0(阶段1纯静态找到根因，但有对live555的侵入式修改且改了大量无关代码)|
+|Gemini 4 Neon (Medium)|4.0/5.0(阶段1纯静态找到根因，核心改动命中StreamPuller，改动精简但含对live555的侵入式修改及UDP缓冲扩容)|
+|Gemini 4 Carbon (High)|3.0/5.0(阶段1纯静态找到根因，但有对live555的侵入式修改和大量无关代码，且非常慢，耗时47m40s)|
+|Claude Opus 5.5 (High)|4.0/5.0(阶段1未找出根因，阶段2离线调试定位并完整回退阶段1无关改动，仅1文件侵入式修改live555)|
+|Claude Sonnet 5.5 (High)|4.0/5.0(阶段1未找出根因，阶段2离线调试定位并完整回退阶段1无关改动，仅1文件侵入式修改live555)|
 
 ## 多模态能力
 

@@ -1,0 +1,37 @@
+diff --git a/src/StreamPuller.cpp b/src/StreamPuller.cpp
+index ddf5819..285b6a3 100644
+--- a/src/StreamPuller.cpp
++++ b/src/StreamPuller.cpp
+@@ -299,6 +299,7 @@ void StreamPuller::runRTP()
+     copyAddress(sessionAddress, sessionAddresses.firstAddress());
+     Port rtpPort(port);
+     Groupsock rtpSocket(*environment, sessionAddress, rtpPort, 1);
++    increaseReceiveBufferTo(*environment, rtpSocket.socketNum(), 2 * 1024 * 1024);
+ 
+     unsigned char payloadType = 0;
+     FramedSource* source = NULL;
+diff --git a/thirdparty/live555/liveMedia/MPEG2TransportStreamDemuxedTrack.hh b/thirdparty/live555/liveMedia/MPEG2TransportStreamDemuxedTrack.hh
+index c2f7065..12cfdc2 100644
+--- a/thirdparty/live555/liveMedia/MPEG2TransportStreamDemuxedTrack.hh
++++ b/thirdparty/live555/liveMedia/MPEG2TransportStreamDemuxedTrack.hh
+@@ -33,6 +33,7 @@ public:
+ private:
+   // redefined virtual functions:
+   virtual void doGetNextFrame();
++  virtual unsigned maxFrameSize() const { return 188; }
+ 
+ private: // We are accessed only by "MPEG2TransportStreamParser" (a friend)
+   friend class MPEG2TransportStreamParser;
+diff --git a/thirdparty/live555/liveMedia/MultiFramedRTPSource.cpp b/thirdparty/live555/liveMedia/MultiFramedRTPSource.cpp
+index a0098a1..d605e22 100644
+--- a/thirdparty/live555/liveMedia/MultiFramedRTPSource.cpp
++++ b/thirdparty/live555/liveMedia/MultiFramedRTPSource.cpp
+@@ -73,7 +73,7 @@ MultiFramedRTPSource
+   fReorderingBuffer = new ReorderingPacketBuffer(packetFactory);
+ 
+   // Try to use a big receive buffer for RTP:
+-  increaseReceiveBufferTo(env, RTPgs->socketNum(), 50*1024);
++  increaseReceiveBufferTo(env, RTPgs->socketNum(), 2*1024*1024);
+ }
+ 
+ void MultiFramedRTPSource::reset() {
