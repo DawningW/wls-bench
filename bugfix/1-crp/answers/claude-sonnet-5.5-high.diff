@@ -1,0 +1,19 @@
+diff --git a/thirdparty/live555/liveMedia/MPEG2TransportStreamDemuxedTrack.cpp b/thirdparty/live555/liveMedia/MPEG2TransportStreamDemuxedTrack.cpp
+index 358664f..6760f3c 100644
+--- a/thirdparty/live555/liveMedia/MPEG2TransportStreamDemuxedTrack.cpp
++++ b/thirdparty/live555/liveMedia/MPEG2TransportStreamDemuxedTrack.cpp
+@@ -24,6 +24,14 @@ MPEG2TransportStreamDemuxedTrack
+ ::MPEG2TransportStreamDemuxedTrack(MPEG2TransportStreamParser& ourParser, u_int16_t pid)
+   : FramedSource(ourParser.envir()),
+     fOurParser(ourParser), fPID(pid) {
++#if CRP_MODIFY
++  // The data of a Transport Stream packet is delivered to the downstream "StreamParser" (e.g. a H.264/H.265
++  // video framer) in one piece, and it is truncated (and the truncated bytes are dropped!) if the downstream
++  // parser has less free space in its bank than that. A "StreamParser" avoids this by swapping its bank early
++  // when its input source reports a "maxFrameSize" (see "StreamParser::ensureValidBytes1()"), so report it.
++  // A Transport Stream packet carries at most 184 bytes of payload.
++  setMaxFrameSize(188);
++#endif
+ }
+ 
+ MPEG2TransportStreamDemuxedTrack::~MPEG2TransportStreamDemuxedTrack() {

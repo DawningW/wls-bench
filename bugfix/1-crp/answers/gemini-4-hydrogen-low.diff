@@ -1,0 +1,13 @@
+diff --git a/src/StreamPuller.cpp b/src/StreamPuller.cpp
+index ddf5819..01ed2ee 100644
+--- a/src/StreamPuller.cpp
++++ b/src/StreamPuller.cpp
+@@ -299,6 +299,8 @@ void StreamPuller::runRTP()
+     copyAddress(sessionAddress, sessionAddresses.firstAddress());
+     Port rtpPort(port);
+     Groupsock rtpSocket(*environment, sessionAddress, rtpPort, 1);
++    // Increase UDP receive buffer to avoid packet loss on bursty I-frames / high-bitrate streams
++    increaseReceiveBufferTo(*environment, rtpSocket.socketNum(), 2 * 1024 * 1024);
+ 
+     unsigned char payloadType = 0;
+     FramedSource* source = NULL;

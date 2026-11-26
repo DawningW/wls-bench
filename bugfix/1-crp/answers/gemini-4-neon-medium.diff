@@ -1,0 +1,67 @@
+diff --git a/src/StreamPuller.cpp b/src/StreamPuller.cpp
+index ddf5819..c766b7a 100644
+--- a/src/StreamPuller.cpp
++++ b/src/StreamPuller.cpp
+@@ -299,6 +299,7 @@ void StreamPuller::runRTP()
+     copyAddress(sessionAddress, sessionAddresses.firstAddress());
+     Port rtpPort(port);
+     Groupsock rtpSocket(*environment, sessionAddress, rtpPort, 1);
++    increaseReceiveBufferTo(*environment, rtpSocket.socketNum(), 2 * 1024 * 1024);
+ 
+     unsigned char payloadType = 0;
+     FramedSource* source = NULL;
+@@ -962,6 +963,7 @@ void StreamPuller::createTransportStream(PIDState_STREAM *pidState, StreamType &
+                             STREAM_TYPE_CODEC_MAP.at(pidState->stream_type) : "";
+ 
+     FramedSource *inputSource = pidState->streamSource;
++    inputSource->setMaxFrameSize(TRANSPORT_PACKET_SIZE); // Prevent StreamParser from truncating TS payload at bank boundary
+     if (streamType.dataType == StreamType::VIDEO)
+     {
+         videoDecoder = VideoDecoder::createNew(codecName,
+diff --git a/thirdparty/live555/liveMedia/MPEG2TransportStreamDemuxedTrack.cpp b/thirdparty/live555/liveMedia/MPEG2TransportStreamDemuxedTrack.cpp
+index 358664f..a9575b8 100644
+--- a/thirdparty/live555/liveMedia/MPEG2TransportStreamDemuxedTrack.cpp
++++ b/thirdparty/live555/liveMedia/MPEG2TransportStreamDemuxedTrack.cpp
+@@ -24,6 +24,9 @@ MPEG2TransportStreamDemuxedTrack
+ ::MPEG2TransportStreamDemuxedTrack(MPEG2TransportStreamParser& ourParser, u_int16_t pid)
+   : FramedSource(ourParser.envir()),
+     fOurParser(ourParser), fPID(pid) {
++#if CRP_MODIFY
++  setMaxFrameSize(188);
++#endif
+ }
+ 
+ MPEG2TransportStreamDemuxedTrack::~MPEG2TransportStreamDemuxedTrack() {
+diff --git a/thirdparty/live555/liveMedia/MultiFramedRTPSource.cpp b/thirdparty/live555/liveMedia/MultiFramedRTPSource.cpp
+index a0098a1..fdd8475 100644
+--- a/thirdparty/live555/liveMedia/MultiFramedRTPSource.cpp
++++ b/thirdparty/live555/liveMedia/MultiFramedRTPSource.cpp
+@@ -73,7 +73,11 @@ MultiFramedRTPSource
+   fReorderingBuffer = new ReorderingPacketBuffer(packetFactory);
+ 
+   // Try to use a big receive buffer for RTP:
++#if CRP_MODIFY
++  increaseReceiveBufferTo(env, RTPgs->socketNum(), 2*1024*1024);
++#else
+   increaseReceiveBufferTo(env, RTPgs->socketNum(), 50*1024);
++#endif
+ }
+ 
+ void MultiFramedRTPSource::reset() {
+diff --git a/thirdparty/live555/liveMedia/StreamParser.cpp b/thirdparty/live555/liveMedia/StreamParser.cpp
+index 433f0ff..7257ae3 100644
+--- a/thirdparty/live555/liveMedia/StreamParser.cpp
++++ b/thirdparty/live555/liveMedia/StreamParser.cpp
+@@ -126,7 +126,12 @@ void StreamParser::ensureValidBytes1(unsigned numBytesNeeded) {
+ 
+   // First, check whether these new bytes would overflow the current
+   // bank.  If so, start using a new bank now.
++#if CRP_MODIFY
++  if (fCurParserIndex + numBytesNeeded > BANK_SIZE ||
++      fTotNumValidBytes + numBytesNeeded > BANK_SIZE) {
++#else
+   if (fCurParserIndex + numBytesNeeded > BANK_SIZE) {
++#endif
+     // Swap banks, but save any still-needed bytes from the old bank:
+     unsigned numBytesToSave = fTotNumValidBytes - fSavedParserIndex;
+     unsigned char const* from = &curBank()[fSavedParserIndex];
